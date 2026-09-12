@@ -1,249 +1,157 @@
-import os
+"""Webhook WhatsApp asynchrone pour WillowAgent."""
+
 import asyncio
+import hashlib
+import hmac
+import json
+import os
+
 import httpx
 import redis.asyncio as redis
-from fastapi import FastAPI, Request, HTTPException, Query, BackgroundTasks
-from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
-
-import database
-from agent import agent_app
-from ingestion import ingest_pdf  # géré par P3
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 
 load_dotenv()
 
+import database
+from agent import agent_app
+from chunking_pipeline import process_whatsapp_pdf
+
+
 app = FastAPI(title="WillowAgent WhatsApp Backend")
 
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "willow_secret_token")
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN") or os.getenv("VERIFY_TOKEN", "willow_secret_token")
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-
-r = redis.from_url(REDIS_URL, decode_responses=True)
-
 WHATSAPP_API = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}"
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-async def send_whatsapp_message(to_phone: str, text: str):
-    """Envoie un message texte, découpé si > 4000 chars."""
-    if not text:
-        return
-    url = f"{WHATSAPP_API}/messages"
+async def send_whatsapp_message(to_phone: str, text: str) -> None:
+    """Envoie une réponse, en découpant les messages trop longs pour WhatsApp."""
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        raise RuntimeError("Configuration WhatsApp incomplète dans .env.")
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        for chunk in chunks:
-            try:
-                await client.post(url, headers=headers, json={
+    async with httpx.AsyncClient(timeout=20) as client:
+        for chunk in (text[index:index + 4000] for index in range(0, len(text), 4000)):
+            response = await client.post(
+                f"{WHATSAPP_API}/messages",
+                headers=headers,
+                json={
                     "messaging_product": "whatsapp",
                     "to": to_phone,
                     "type": "text",
-                    "text": {"body": chunk}
-                })
-            except Exception as e:
-                print(f"[send_whatsapp] erreur: {e}")
-
-
-async def download_whatsapp_media(media_id: str) -> bytes:
-    """Récupère un média (PDF) depuis WhatsApp."""
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        # 1. Obtenir l'URL du média
-        meta_res = await client.get(
-            f"https://graph.facebook.com/v18.0/{media_id}",
-            headers=headers
-        )
-        meta = meta_res.json()
-        media_url = meta.get("url")
-        if not media_url:
-            raise ValueError(f"Média introuvable: {meta}")
-
-        # 2. Télécharger le binaire
-        file_res = await client.get(media_url, headers=headers)
-        return file_res.content
+                    "text": {"body": chunk},
+                },
+            )
+            response.raise_for_status()
 
 
 async def is_duplicate(message_id: str) -> bool:
-    """Empêche le double traitement (WhatsApp retry)."""
-    key = f"msg:{message_id}"
-    # SETNX retourne True si la clé n'existait pas
-    created = await r.set(key, "1", ex=3600, nx=True)
-    return not created
+    """Évite les doublons WhatsApp; le bot reste fonctionnel sans Redis."""
+    if not message_id:
+        return False
+    try:
+        return not await redis_client.set(f"msg:{message_id}", "1", ex=3600, nx=True)
+    except Exception as exc:
+        print(f"[redis] indisponible, déduplication désactivée : {exc}")
+        return False
 
 
-# ============================================================
-# WEBHOOK VERIFICATION (GET)
-# ============================================================
+def is_valid_webhook_signature(payload: bytes, signature: str | None) -> bool:
+    if not WHATSAPP_APP_SECRET:
+        return False
+    expected = "sha256=" + hmac.new(
+        WHATSAPP_APP_SECRET.encode(), payload, hashlib.sha256
+    ).hexdigest()
+    return bool(signature) and hmac.compare_digest(expected, signature)
+
 
 @app.get("/webhook")
 async def verify_webhook(
     mode: str = Query(None, alias="hub.mode"),
     token: str = Query(None, alias="hub.verify_token"),
-    challenge: str = Query(None, alias="hub.challenge")
+    challenge: str = Query(None, alias="hub.challenge"),
 ):
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        return PlainTextResponse(challenge)
-    raise HTTPException(status_code=403, detail="Token invalide.")
+        return PlainTextResponse(challenge or "")
+    raise HTTPException(status_code=403, detail="Token de vérification invalide.")
 
-
-# ============================================================
-# WEBHOOK RECEPTION (POST)
-# ============================================================
 
 @app.post("/webhook")
 async def handle_webhook(request: Request, background: BackgroundTasks):
+    raw_payload = await request.body()
+    if not is_valid_webhook_signature(raw_payload, request.headers.get("X-Hub-Signature-256")):
+        raise HTTPException(status_code=403, detail="Signature WhatsApp invalide.")
     try:
-        data = await request.json()
-        entry = data["entry"][0]["changes"][0]["value"]
-
-        # Ignore les events "statuses" (delivered, read…)
-        if "messages" not in entry:
+        value = json.loads(raw_payload)["entry"][0]["changes"][0]["value"]
+        if "messages" not in value:
             return {"status": "ignored"}
-
-        message = entry["messages"][0]
-        message_id = message.get("id", "")
-        phone_number = message["from"]
-
-        # Dédup
-        if await is_duplicate(message_id):
+        message = value["messages"][0]
+        if await is_duplicate(message.get("id", "")):
             return {"status": "duplicate"}
-
-        # Traiter en arrière-plan pour répondre <1s à Meta
-        background.add_task(process_message, phone_number, message)
-
-    except Exception as e:
-        print(f"[webhook] erreur: {e}")
-
+        background.add_task(process_message, message["from"], message)
+    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+        print(f"[webhook] payload invalide : {exc}")
     return {"status": "ok"}
 
 
-# ============================================================
-# LOGIQUE MÉTIER (background)
-# ============================================================
-
-async def process_message(phone_number: str, message: dict):
+async def process_message(phone_number: str, message: dict) -> None:
+    """Orchestre le profil utilisateur, l'agent et l'ingestion PDF hors réponse webhook."""
     try:
         msg_type = message.get("type")
         user_text = message.get("text", {}).get("body", "").strip()
+        user = await asyncio.to_thread(database.get_user, phone_number)
 
-        user = database.get_user(phone_number)
-
-        # ---------- 1. NOUVEL UTILISATEUR ----------
         if not user:
-            database.create_user(phone_number, step="awaiting_role")
-            await send_whatsapp_message(phone_number,
-                "👋 Bienvenue sur WillowAgent !\n\n"
-                "Pour adapter mes réponses, quel est ton profil ?\n"
-                "1️⃣ Étudiant (explications simples, fiches, quiz)\n"
-                "2️⃣ Chercheur (analyse rigoureuse, sources académiques)"
+            await asyncio.to_thread(database.create_user, phone_number, "awaiting_role")
+            await send_whatsapp_message(
+                phone_number,
+                "👋 Bienvenue sur WillowAgent !\n\nChoisis ton profil :\n"
+                "1️⃣ Étudiant\n2️⃣ Chercheur",
             )
             return
 
-        # ---------- 2. COMMANDE /mode ----------
         if msg_type == "text" and user_text.lower() == "/mode":
-            database.update_user_step(phone_number, step="awaiting_role")
-            await send_whatsapp_message(phone_number,
-                "Choisis ton nouveau profil :\n1. 🎓 Étudiant\n2. 🔬 Chercheur"
-            )
+            await asyncio.to_thread(database.update_user_step, phone_number, "awaiting_role")
+            await send_whatsapp_message(phone_number, "Choisis ton nouveau profil :\n1. Étudiant\n2. Chercheur")
             return
 
-        # ---------- 3. EN ATTENTE DU RÔLE ----------
         if user["step"] == "awaiting_role":
-            if user_text == "1":
-                database.update_user_role(phone_number, role="etudiant")
-                await send_whatsapp_message(phone_number,
-                    "✅ Profil *Étudiant* activé ! Envoie un PDF ou pose ta question."
-                )
-            elif user_text == "2":
-                database.update_user_role(phone_number, role="chercheur")
-                await send_whatsapp_message(phone_number,
-                    "✅ Profil *Chercheur* activé ! Pose ta question ou envoie un document."
-                )
-            else:
-                await send_whatsapp_message(phone_number,
-                    "Réponds uniquement par *1* (Étudiant) ou *2* (Chercheur)."
-                )
+            role = {"1": "etudiant", "2": "chercheur"}.get(user_text)
+            if not role:
+                await send_whatsapp_message(phone_number, "Réponds uniquement par *1* ou *2*.")
+                return
+            await asyncio.to_thread(database.update_user_role, phone_number, role)
+            await send_whatsapp_message(phone_number, f"✅ Profil *{role.title()}* activé !")
             return
 
-        # ---------- 4. UTILISATEUR ACTIF ----------
-        if user["step"] != "active":
-            return
-
-        # --- 4a. TEXTE → Agent ---
         if msg_type == "text":
             await send_whatsapp_message(phone_number, "⏳ Je réfléchis…")
-            try:
-                result = await asyncio.to_thread(
-                    agent_app.invoke,
-                    {
-                        "question": user_text,
-                        "user_role": user["role"],
-                        "user_id": phone_number
-                    }
-                )
-                answer = result.get("final_answer", "❌ Pas de réponse générée.")
-                await send_whatsapp_message(phone_number, answer)
-            except Exception as e:
-                print(f"[agent] erreur: {e}")
-                await send_whatsapp_message(phone_number,
-                    "❌ Erreur pendant le traitement. Réessaie."
-                )
-
-        # --- 4b. DOCUMENT PDF → Ingestion ---
+            result = await asyncio.to_thread(
+                agent_app.invoke,
+                {"question": user_text, "user_role": user["role"], "user_id": phone_number},
+            )
+            await send_whatsapp_message(phone_number, result.get("final_answer", "❌ Pas de réponse générée."))
         elif msg_type == "document":
-            doc = message.get("document", {})
-            mime = doc.get("mime_type", "")
-            filename = doc.get("filename", "document.pdf")
-            media_id = doc.get("id")
-
-            if "pdf" not in mime.lower():
-                await send_whatsapp_message(phone_number,
-                    "⚠️ Envoie uniquement des fichiers PDF pour l'instant."
-                )
+            document = message.get("document", {})
+            if document.get("mime_type") != "application/pdf":
+                await send_whatsapp_message(phone_number, "⚠️ Envoie uniquement un PDF.")
                 return
-
-            await send_whatsapp_message(phone_number,
-                "⚙️ Traitement de ton PDF en cours…"
+            await send_whatsapp_message(phone_number, "⚙️ Traitement du PDF en cours…")
+            ok = await asyncio.to_thread(process_whatsapp_pdf, document["id"], phone_number)
+            await send_whatsapp_message(
+                phone_number,
+                "✅ PDF indexé. Pose maintenant tes questions." if ok else "❌ Impossible de traiter ce PDF.",
             )
-            try:
-                pdf_bytes = await download_whatsapp_media(media_id)
-                doc_id = await asyncio.to_thread(
-                    ingest_pdf, phone_number, pdf_bytes, filename
-                )
-                await send_whatsapp_message(phone_number,
-                    f"📄 Document *{filename}* reçu et indexé !\n"
-                    "Tu peux maintenant me poser tes questions."
-                )
-            except Exception as e:
-                print(f"[ingestion] erreur: {e}")
-                await send_whatsapp_message(phone_number,
-                    "❌ Impossible de traiter ce PDF. Réessaie."
-                )
-
-        # --- 4c. AUDIO (optionnel) ---
-        elif msg_type == "audio":
-            await send_whatsapp_message(phone_number,
-                "🎙️ Notes vocales bientôt disponibles."
-            )
-
-        # --- 4d. AUTRE ---
         else:
-            await send_whatsapp_message(phone_number,
-                "Je gère pour l'instant : texte, PDF. Envoie-moi l'un des deux."
-            )
+            await send_whatsapp_message(phone_number, "Envoie-moi une question ou un document PDF.")
+    except Exception as exc:
+        print(f"[process_message] erreur : {exc}")
 
-    except Exception as e:
-        print(f"[process_message] erreur: {e}")
-
-
-# ============================================================
-# HEALTHCHECK
-# ============================================================
 
 @app.get("/")
 async def health():
