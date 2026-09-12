@@ -3,10 +3,11 @@ import requests
 from fastapi import FastAPI, Request, HTTPException, Query
 from dotenv import load_dotenv
 
+load_dotenv()
+
 import database
 from agent import agent_app  # Développé par la Personne 1
-
-load_dotenv()
+from chunking_pipeline import process_whatsapp_pdf
 
 app = FastAPI(title="WillowAgent WhatsApp Backend")
 
@@ -103,9 +104,14 @@ async def handle_webhook(request: Request):
                 send_whatsapp_message(phone_number, result["final_answer"])
                 
             elif msg_type == "document":
-                # Traitement PDF (Géré avec la Personne 3)
                 send_whatsapp_message(phone_number, "⚙️ Traitement de ton PDF en cours...")
-                # Logique de téléchargement + chunking à appeler ici
+                document = message.get("document", {})
+                if document.get("mime_type") != "application/pdf":
+                    send_whatsapp_message(phone_number, "Envoie-moi un document au format PDF.")
+                elif process_whatsapp_pdf(document["id"], phone_number):
+                    send_whatsapp_message(phone_number, "✅ PDF indexé. Tu peux maintenant poser tes questions.")
+                else:
+                    send_whatsapp_message(phone_number, "⚠️ Je n'ai pas pu traiter ce PDF. Réessaie plus tard.")
 
     except Exception as e:
         print(f"Erreur Webhook: {e}")
