@@ -15,6 +15,7 @@ load_dotenv()
 EMBEDDING_MODEL = os.getenv(
     "HF_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
+ADMIN_RAG_USER_ID = "__admin__"
 
 
 @lru_cache(maxsize=1)
@@ -84,8 +85,13 @@ def get_vector_store() -> VectorStore:
 
 
 def search_user_pdf(query: str, phone_number: str, k: int = 5) -> str:
-    """Retourne uniquement les passages PDF du numéro WhatsApp appelant."""
-    results = get_vector_store().search(query=query, user_id=phone_number, match_count=k)
+    """Retourne les passages privés puis la documentation RAG partagée admin."""
+    store = get_vector_store()
+    results = store.search(query=query, user_id=phone_number, match_count=k)
+    if phone_number != ADMIN_RAG_USER_ID:
+        results.extend(store.search(query=query, user_id=ADMIN_RAG_USER_ID, match_count=k))
+    results.sort(key=lambda item: item.get("similarity", 0), reverse=True)
+    results = results[:k]
     if not results:
         return "[Aucun extrait de PDF trouvé pour cette question.]"
     passages = []
