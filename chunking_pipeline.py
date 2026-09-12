@@ -99,11 +99,13 @@ def custom_chunking(
 
 # 3. Pipeline complet d'ingestion, à appeler depuis main.py
 def process_whatsapp_pdf(media_id: str, phone_number: str) -> bool:
-    try:
-        # A. Téléchargement
-        pdf_bytes = download_whatsapp_media(media_id)
+    return process_pdf_bytes(download_whatsapp_media(media_id), phone_number)
 
-        # B. Extraction du texte page par page
+
+def process_pdf_bytes(pdf_bytes: bytes, user_id: str) -> bool:
+    """Indexe un PDF déjà téléchargé (WhatsApp, Telegram ou autre canal)."""
+    try:
+        # A. Extraction du texte page par page
         pdf_reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
         pages_text = []
         for i, page in enumerate(pdf_reader.pages):
@@ -117,9 +119,7 @@ def process_whatsapp_pdf(media_id: str, phone_number: str) -> bool:
         texts_to_embed = [doc["text"] for doc in chunked_docs]
         if not texts_to_embed:
             raise ValueError("Le PDF ne contient aucun texte exploitable.")
-        metadatas = [
-            {"user_id": phone_number, "page": doc["page"]} for doc in chunked_docs
-        ]
+        metadatas = [{"user_id": user_id, "page": doc["page"]} for doc in chunked_docs]
 
         # E. Vectorisation (Ollama) + sauvegarde (Supabase pgvector)
         vector_store = database.get_vector_store()
