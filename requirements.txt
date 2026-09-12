@@ -9,3 +9,4 @@ langchain-community
 psycopg2-binary
 pypdf2
 python-multipart
+huggingface-hub
