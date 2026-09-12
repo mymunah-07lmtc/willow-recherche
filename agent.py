@@ -14,7 +14,7 @@ import exa_tool
 
 load_dotenv()
 
-HF_MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+HF_MODEL = os.getenv("HF_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 
 
 class AgentState(TypedDict):
