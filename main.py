@@ -1,4 +1,7 @@
 import os
+import hashlib
+import hmac
+import json
 import requests
 from fastapi import FastAPI, Request, HTTPException, Query
 from dotenv import load_dotenv
@@ -11,9 +14,10 @@ from chunking_pipeline import process_whatsapp_pdf
 
 app = FastAPI(title="WillowAgent WhatsApp Backend")
 
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "willow_secret_token")
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN") or os.getenv("VERIFY_TOKEN", "willow_secret_token")
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
 
 # --- HELPER : ENVOI WHATSAPP ---
 def send_whatsapp_message(to_phone: str, text: str):
@@ -31,6 +35,16 @@ def send_whatsapp_message(to_phone: str, text: str):
     response = requests.post(url, json=payload, headers=headers)
     return response.json()
 
+
+def is_valid_webhook_signature(payload: bytes, signature: str | None) -> bool:
+    """Valide la signature Meta pour empêcher les requêtes webhook forgées."""
+    if not WHATSAPP_APP_SECRET:
+        return False
+    expected = "sha256=" + hmac.new(
+        WHATSAPP_APP_SECRET.encode(), payload, hashlib.sha256
+    ).hexdigest()
+    return bool(signature) and hmac.compare_digest(expected, signature)
+
 # --- VERIFICATION WEBHOOK (GET) ---
 @app.get("/webhook")
 async def verify_webhook(
@@ -45,7 +59,12 @@ async def verify_webhook(
 # --- RECEPTION MESSAGES (POST) ---
 @app.post("/webhook")
 async def handle_webhook(request: Request):
-    data = await request.json()
+    raw_payload = await request.body()
+    if not is_valid_webhook_signature(
+        raw_payload, request.headers.get("X-Hub-Signature-256")
+    ):
+        raise HTTPException(status_code=403, detail="Signature WhatsApp invalide.")
+    data = json.loads(raw_payload)
     
     try:
         # Extraction basique du payload WhatsApp Meta
