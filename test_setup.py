@@ -28,7 +28,7 @@ def test_embedding():
         return True
     except Exception as e:
         print(f"   ÉCHEC : {e}")
-        print("   → vérifie HF_API_KEY dans le .env, et ta connexion internet.")
+        print("   -> vérifie HUGGINGFACE_API_KEY dans le .env et ta connexion Internet.")
         return False
 
 
@@ -57,7 +57,7 @@ def test_insert_and_search():
         return True
     except Exception as e:
         print(f"   ÉCHEC : {e}")
-        print("   → vérifie SUPABASE_URL/SUPABASE_KEY dans le .env, et que le script SQL a bien été exécuté.")
+        print("   -> vérifie SUPABASE_URL/SUPABASE_KEY dans le .env et exécute supabase_setup.sql.")
         return False
 
 
